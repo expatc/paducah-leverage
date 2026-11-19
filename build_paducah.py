@@ -2,9 +2,11 @@
 """
 Paducah market leverage — automated monthly build.
 
-PRIMARY SOURCE: Redfin Data Center city-level market tracker. Real MLS
-closings, scoped to Paducah city limits, with months of supply already
-computed. Redfin publishes these files openly and asks only for citation.
+PRIMARY SOURCE: Redfin Data Center city-level files (housing market and
+price drops). Real MLS closings, scoped to Paducah city limits, with months
+of supply already computed. Redfin publishes these files openly and asks
+only for citation. City rows are rolling three-month windows; each reading
+is labelled by the month its window ends.
 
 SECONDARY: Zillow Research metro CSVs, for the home-value index and as a
 sanity check. Metro geography, so it covers more rural ground.
@@ -14,17 +16,22 @@ own bulk exports.
 """
 
 import csv
-import gzip
 import io
 import json
 import sys
 import urllib.request
 from datetime import datetime, timezone
 
-REDFIN_CITY = ("https://redfin-public-data.s3.us-west-2.amazonaws.com/"
-               "redfin_market_tracker/city_market_tracker.tsv000.gz")
+# Redfin moved its bulk files here in 2026 (the old redfin_market_tracker/
+# .tsv000.gz path now returns 403). Current paths are listed at
+# https://www.redfin.com/news/data-center/downloads/
+REDFIN = ("https://redfin-public-data.s3.us-west-2.amazonaws.com/"
+          "redfin_data_center/")
+REDFIN_MARKET = REDFIN + "housing_market/monthly/all_cities.csv"
+REDFIN_DROPS = REDFIN + "price_drops/monthly/all_cities.csv"
 ZILLOW = "https://files.zillowstatic.com/research/public_csvs/"
 CITY, STATE = "Paducah", "KY"
+REGION = f"{CITY}, {STATE}"          # Redfin's REGION NAME for the city
 METRO = "Paducah, KY"
 UA = {"User-Agent": "paducah-tracker/2.0"}
 
@@ -44,45 +51,69 @@ BASELINES = {
 }
 
 
-def fetch_redfin():
-    """Stream the city file, keep only Paducah KY 'All Residential' rows."""
-    print("Streaming Redfin city market tracker (large file, a few minutes)...",
-          file=sys.stderr)
-    req = urllib.request.Request(REDFIN_CITY, headers=UA)
-    out = {}
+def stream_region(url, required):
+    """Stream a Redfin Data Center city CSV; yield one dict per Paducah row."""
+    req = urllib.request.Request(url, headers=UA)
     with urllib.request.urlopen(req, timeout=900) as resp:
-        stream = io.TextIOWrapper(gzip.GzipFile(fileobj=resp),
-                                  encoding="utf-8", errors="replace")
-        reader = csv.reader(stream, delimiter="\t")
-        header = [c.strip('"').lower() for c in next(reader)]
-        idx = {c: i for i, c in enumerate(header)}
-        for row in reader:
+        stream = io.TextIOWrapper(resp, encoding="utf-8-sig",
+                                  errors="replace", newline="")
+        header = next(csv.reader([stream.readline()]))
+        missing = [c for c in ["REGION NAME", "REGION TYPE", "PERIOD END",
+                               *required] if c not in header]
+        if missing:
+            raise SystemExit(f"Redfin changed the schema of {url}: "
+                             f"missing columns {missing}")
+        for line in stream:
+            if REGION not in line:          # cheap skip; the files are large
+                continue
+            row = next(csv.reader([line]))
             if len(row) < len(header):
                 continue
-            if (row[idx["city"]].strip('"') == CITY
-                    and row[idx["state_code"]].strip('"') == STATE
-                    and row[idx["property_type"]].strip('"') == "All Residential"):
-                def f(col):
-                    v = row[idx[col]].strip('"')
-                    if v in ("", "NA"):
-                        return None
-                    try:
-                        return float(v)
-                    except ValueError:
-                        return None
-                drops, above = f("price_drops"), f("sold_above_list")
-                out[row[idx["period_begin"]].strip('"')[:7]] = {
-                    "inventory":    f("inventory"),
-                    "homes_sold":   f("homes_sold"),
-                    "new_listings": f("new_listings"),
-                    "supply":       f("months_of_supply"),
-                    "dom":          f("median_dom"),
-                    "stl":          f("avg_sale_to_list"),
-                    "drops":        drops * 100 if drops is not None else None,
-                    "above_list":   above * 100 if above is not None else None,
-                    "median_price": f("median_sale_price"),
-                }
-    print(f"  Redfin: {len(out)} months for {CITY}, {STATE}", file=sys.stderr)
+            rec = dict(zip(header, row))
+            if rec["REGION NAME"] == REGION and rec["REGION TYPE"] == "City":
+                yield rec
+
+
+def num(rec, col):
+    v = (rec.get(col) or "").strip()
+    if v in ("", "NA"):
+        return None
+    try:
+        return float(v)
+    except ValueError:
+        return None
+
+
+MARKET_COLS = {
+    "inventory":    "INVENTORY",
+    "homes_sold":   "HOMES SOLD",
+    "new_listings": "NEW LISTINGS",
+    "supply":       "MONTHS OF SUPPLY",
+    "dom":          "MEDIAN DAYS ON MARKET (DAYS)",
+    "above_list":   "SHARE SOLD ABOVE LIST (%)",
+    "median_price": "MEDIAN SALE PRICE NSA ($)",
+}
+STL_COL = "AVERAGE SALE TO LIST RATIO (%)"
+DROPS_COL = "PERCENT ACTIVE WITH PRICE DROPS (%)"
+
+
+def fetch_redfin():
+    """Paducah rows from the two city files, keyed by the window's end month."""
+    print("Streaming Redfin city housing-market file (large, a few minutes)...",
+          file=sys.stderr)
+    out = {}
+    for rec in stream_region(REDFIN_MARKET, [*MARKET_COLS.values(), STL_COL]):
+        stl = num(rec, STL_COL)             # published as a percentage
+        row = {k: num(rec, col) for k, col in MARKET_COLS.items()}
+        row["stl"] = stl / 100 if stl is not None else None
+        row["drops"] = None
+        out[rec["PERIOD END"][:7]] = row
+    print("Streaming Redfin city price-drops file...", file=sys.stderr)
+    for rec in stream_region(REDFIN_DROPS, [DROPS_COL]):
+        mo = rec["PERIOD END"][:7]
+        if mo in out:
+            out[mo]["drops"] = num(rec, DROPS_COL)
+    print(f"  Redfin: {len(out)} readings for {REGION}", file=sys.stderr)
     return out
 
 
@@ -175,7 +206,7 @@ def build():
         raise SystemExit("No month has all four signals.")
 
     return {
-        "city": f"{CITY}, {STATE}",
+        "city": REGION,
         "built": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
         "latest": full[-1],
         "series": full[-48:],
@@ -241,13 +272,13 @@ footer a{color:var(--muted)}
 <text x="286" y="122" text-anchor="middle" font-family="IBM Plex Sans" font-size="11.5" fill="var(--buyer)">Buyers</text>
 </svg>
 <div class="verdict">__VERDICT__<span>__SCORELINE__</span></div>
-<div class="asof">As of __ASOF__ &middot; __SOLD__ sold, __INV__ active</div></div>
+<div class="asof">Three months ending __ASOF__ &middot; __SOLD__ sold, __INV__ active</div></div>
 <section><h2>What's driving it</h2><table><tbody>__PARTS__</tbody></table>
 <p class="note">__SPREAD__</p></section>
 <section><h2>Two years of readings</h2><svg class="spark" viewBox="0 0 320 70">__SPARK__</svg>
-<table><thead><tr><th>Month</th><th class="n">Supply</th><th class="n">S/L</th><th class="n">DOM</th><th class="n">Score</th></tr></thead>
+<table><thead><tr><th>3 mo. to</th><th class="n">Supply</th><th class="n">S/L</th><th class="n">DOM</th><th class="n">Score</th></tr></thead>
 <tbody>__HIST__</tbody></table></section>
-<footer>City figures from the <a href="https://www.redfin.com/news/data-center/">Redfin Data Center</a>, covering Paducah city limits and drawn from MLS closings. Home values from <a href="https://www.zillow.com/research/data/">Zillow Research</a>, which only reports transaction dynamics at metro level. Signals are scored against neutral baselines of 5.0 months of supply, 0.990 sale-to-list, 45 days on market, and 20% of listings cutting price &mdash; all four are constants at the top of the build script. Redfin's city file runs about two months behind. Built __BUILT__.</footer>
+<footer>City figures from the <a href="https://www.redfin.com/news/data-center/">Redfin Data Center</a>, covering Paducah city limits and drawn from MLS closings. Home values from <a href="https://www.zillow.com/research/data/">Zillow Research</a>, which only reports transaction dynamics at metro level. Signals are scored against neutral baselines of 5.0 months of supply, 0.990 sale-to-list, 45 days on market, and 20% of listings cutting price &mdash; all four are constants at the top of the build script. Each reading is a rolling three-month window, labelled by the month it ends, which is how Redfin now publishes city figures. Built __BUILT__.</footer>
 </div></body></html>"""
 
 
@@ -267,7 +298,7 @@ def render(d):
 
     line = f"{s:+.0f} on a \u2212100 to +100 scale"
     if prev is not None:
-        line += f" \u00b7 {s - prev:+.0f} since last month"
+        line += f" \u00b7 {s - prev:+.0f} since the prior reading"
 
     parts = ""
     for p in latest["parts"]:
@@ -285,7 +316,7 @@ def render(d):
                 f"seller-friendly and the most buyer-friendly signal. Averaging signals that "
                 f"pull opposite ways makes a weak summary, so read the rows, not the beam.")
     else:
-        note = "The four signals point the same general direction this month."
+        note = "The four signals point the same general direction in this reading."
     if latest.get("metro_supply"):
         note += (f" Zillow's wider metro reads {latest['metro_supply']:.1f} months of supply "
                  f"against the city's {latest['supply']:.1f}; rural McCracken County moves "

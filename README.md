@@ -5,7 +5,7 @@ with no input from you.
 
 ## What it does
 
-`build_paducah.py` streams Redfin's city-level market tracker, pulls the
+`build_paducah.py` streams Redfin's city-level Data Center files, pulls the
 Paducah, KY rows, scores four leverage signals, and writes `index.html` and
 `data.json`. GitHub Actions runs it on the 18th of each month and publishes
 the result to GitHub Pages.
@@ -50,9 +50,12 @@ convinces you Paducah's normal sits elsewhere, change them there.
 
 ## Three limits worth knowing
 
-**Redfin's city file lags about two months.** May 2026 is the newest
-complete month as of this writing. That is fine for trend-watching and
-useless for reacting to this week.
+**Redfin's city figures are rolling three-month windows.** Each reading is
+labelled by the month its window ends (the October 2026 reading covers
+August through October). That smooths single-month noise in a small market,
+and it means the page moves slowly: fine for trend-watching, useless for
+reacting to this week. Before November 2026 this page used Redfin's older
+single-month city file, which Redfin retired.
 
 **The average hides disagreement.** In May 2026 the four signals spanned
 148 points: months of supply said sellers, price cuts said buyers. The page

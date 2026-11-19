@@ -9,6 +9,7 @@ on:
 
 permissions:
   contents: read
+  actions: write            # lets the keep-alive step below re-enable this workflow
   pages: write
   id-token: write
 
@@ -33,6 +34,14 @@ jobs:
       - uses: actions/upload-pages-artifact@v3
         with:
           path: site
+      - name: Keep the schedule alive
+        # GitHub switches scheduled workflows off after 60 days without repo
+        # activity (it happened 2026-11-18). Re-enabling through the API
+        # resets that clock, so a monthly run keeps itself alive.
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/monthly.yml/enable"
 
   deploy:
     needs: build
